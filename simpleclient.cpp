@@ -21,6 +21,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <signal.h>
 #include <stdint.h>
 #include <iostream>
 #include <sys/types.h>
@@ -34,11 +35,13 @@
 #include <chrono> // Added to measure time of requests
 #include <stdlib.h>
 #include <sys/select.h>
+#include <sys/time.h>
 
 #include "reqchannel.h"
 #include "boundedbuffer.h"
 
 #define NUM_PEOPLE 3
+#define TIME_INTERVAL 1000   //Number of milliseconds to call histogram
 
 using namespace std;
 using namespace std::chrono;
@@ -63,6 +66,7 @@ BoundedBuffer *response_buffers[NUM_PEOPLE];
 
 int histograms[NUM_PEOPLE][100] = {}; // 100 possible numbers for each of the request threads
 int* name_ids[NUM_PEOPLE];
+volatile sig_atomic_t print_histo_flag = false;
 
 const string request_names[] = {"Joe Smith", "Jane Smith", "John Doe"};
 
@@ -128,6 +132,10 @@ void* request_thread(void* req_id) {
     return 0;
 }
 
+void histogram_alarm(int sig){
+    print_histo_flag = true;
+}
+
 // Function to be performed by the event handler thread
 void* event_thread(void* c){
     RequestChannel chan("control", RequestChannel::CLIENT_SIDE);
@@ -136,7 +144,6 @@ void* event_thread(void* c){
     int persons[num_worker_threads];
     int write_count, read_count, max, selected = 0;
     Response response = Response("blank", -1, -1);
-    bool done = false;
     struct timeval to = {0,10}; // Select timeout
     
     // Setup request channels and start off persons[] clean
@@ -154,8 +161,13 @@ void* event_thread(void* c){
         write_count++;
     }
     
-    // Handle the rest of the requests
-    while(!done){
+    while(true){
+        //Print histogram if flagged
+        if(print_histo_flag){
+            print_histograms();
+            print_histo_flag = false;
+        }
+        
         FD_ZERO(&read_fd_set);
         for(int i = 0; i < num_worker_threads; i++){
             if(channels[i]->read_fd() > max)
@@ -173,7 +185,7 @@ void* event_thread(void* c){
                     response_buffers[persons[i]]->push(Response(server_response, persons[i], 0));
                     
                     // If there are more requests to handle, take care of it
-                    if(write_count < num_requests * 3){
+                    if(write_count < num_requests * NUM_PEOPLE){
                         response = buffer->pop();
                         channels[i]->cwrite(response.data);
                         persons[i] = response.req_id;
@@ -184,7 +196,7 @@ void* event_thread(void* c){
         }
         
         // No more requests to read
-        if(read_count == num_requests * 3)
+        if(read_count == num_requests * NUM_PEOPLE)
             break;
     }
     
@@ -239,7 +251,7 @@ int main(int argc, char * argv[]) {
                 num_worker_threads = 15;
         }
     }
-
+   
     pthread_t request_threads[NUM_PEOPLE];
     pthread_t event_handler_thread;
     pthread_t stats_threads[NUM_PEOPLE];
@@ -259,6 +271,16 @@ int main(int argc, char * argv[]) {
     } else {
         cout << "CLIENT STARTED:" << endl;
 
+        signal(SIGALRM, histogram_alarm);   //Tieing alarm to handler
+        struct itimerval timer;
+        timer.it_value.tv_sec = TIME_INTERVAL/1000;
+        timer.it_value.tv_usec = (TIME_INTERVAL*1000) % 1000000;
+        timer.it_interval = timer.it_value;
+        if(setitimer(ITIMER_REAL, &timer, NULL) == -1){
+            perror("error calling setitimer()");
+        }
+
+        
         cout << "Establishing control channel... " << flush;
         RequestChannel chan("control", RequestChannel::CLIENT_SIDE);
         cout << "done." << endl;;
